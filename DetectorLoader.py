@@ -2,6 +2,7 @@ import time
 import torch
 import numpy as np
 import torchvision.transforms as transforms
+import os
 
 from queue import Queue
 from threading import Thread
@@ -29,7 +30,32 @@ class TinyYOLOv3_onecls(object):
                  device='cpu'):
         self.input_size = input_size
         self.model = Darknet(config_file).to(device)
-        self.model.load_state_dict(torch.load(weight_file, map_location=device))
+        
+        # 모델 로딩 오류 처리
+        try:
+            self.model.load_state_dict(torch.load(weight_file, map_location=device))
+        except Exception as e:
+            print(f"기본 로딩 방법으로 모델을 불러올 수 없습니다: {e}")
+            try:
+                # 다른 방법으로 시도 (pickle 프로토콜 호환성 문제용)
+                print(f"다른 방법으로 모델 로딩 시도...")
+                state_dict = torch.load(weight_file, map_location=device, pickle_module=torch.serialization.pickle)
+                self.model.load_state_dict(state_dict)
+                print("성공적으로 모델을 로드했습니다.")
+            except Exception as e2:
+                print(f"두 번째 방법도 실패했습니다: {e2}")
+                try:
+                    # 마지막 방법으로 시도 (Python 버전 차이 대응)
+                    print(f"Python 2.x/3.x 호환성 문제일 수 있습니다. 마지막 방법으로 시도...")
+                    with open(weight_file, 'rb') as f:
+                        # 바이너리 모드로 읽어서 호환성 문제 해결 시도
+                        state_dict = torch.load(f, map_location=device)
+                        self.model.load_state_dict(state_dict)
+                    print("성공적으로 모델을 로드했습니다.")
+                except Exception as e3:
+                    print(f"모든 방법이 실패했습니다. 원본 가중치 파일을 확인하세요: {e3}")
+                    raise RuntimeError("모델 로딩 실패")
+            
         self.model.eval()
         self.device = device
 

@@ -22,7 +22,21 @@ class TSSTG(object):
         self.device = device
 
         self.model = TwoStreamSpatialTemporalGraph(self.graph_args, self.num_class).to(self.device)
-        self.model.load_state_dict(torch.load(weight_file, map_location='cpu'))
+        
+        try:
+            self.model.load_state_dict(torch.load(weight_file, map_location='cpu'))
+        except Exception as e:
+            print(f"액션 인식 모델 로딩 실패: {e}")
+            try:
+                print("다른 방법으로 액션 인식 모델 로딩 시도...")
+                with open(weight_file, 'rb') as f:
+                    state_dict = torch.load(f, map_location='cpu')
+                    self.model.load_state_dict(state_dict)
+                print("성공적으로 모델을 로드했습니다.")
+            except Exception as e2:
+                print(f"액션 인식 모델 로딩 재시도 실패: {e2}")
+                raise RuntimeError("액션 인식 모델 로딩 실패")
+                
         self.model.eval()
 
     def predict(self, pts, image_size):
