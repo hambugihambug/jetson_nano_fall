@@ -4,7 +4,6 @@ import time
 import torch
 import argparse
 import numpy as np
-from requests import post
 
 from Detection.Utils import ResizePadding
 from CameraLoader import CamLoader, CamLoader_Q
@@ -55,20 +54,6 @@ def image_resize(image, width = None, height = None, inter = cv2.INTER_AREA):
     return resized
 
 
-def send_whatsapp(attachment, message, phone):
-    files = {}
-    if attachment and os.path.exists(attachment):
-        files["attachment1"] = open(attachment, "rb")
-
-    params = {"message": message,
-              "recipient_phone": phone,
-              "ignore_replies": True,
-              }
-
-    result = post("http://%s/api/whastapp_messages/" % "agricsec.meteor-comm.com", data=params, files=files)
-    print(result.text)
-
-
 def preproc(image):
     """preprocess function for CameraLoader.
     """
@@ -90,9 +75,9 @@ if __name__ == '__main__':
     par = argparse.ArgumentParser(description='Human Fall Detection Demo.')
     par.add_argument('-C', '--camera', default=source,  # required=True,  # default=2,
                      help='Source of camera or video file path.')
-    par.add_argument('--detection_input_size', type=int, default=384,
+    par.add_argument('--detection_input_size', type=int, default=320,
                      help='Size of input in detection model in square must be divisible by 32 (int).')
-    par.add_argument('--pose_input_size', type=str, default='224x160',
+    par.add_argument('--pose_input_size', type=str, default='192x128',
                      help='Size of input in pose model must be divisible by 32 (h, w)')
     par.add_argument('--pose_backbone', type=str, default='resnet50',
                      help='Backbone model for SPPE FastPose model.')
@@ -102,11 +87,20 @@ if __name__ == '__main__':
                      help='Show skeleton pose.')
     par.add_argument('--save_out', type=str, default='',
                      help='Save display to video file.')
-    par.add_argument('--device', type=str, default='cpu',
+    par.add_argument('--device', type=str, default='cuda',
                      help='Device to run model on cpu or cuda.')
     args = par.parse_args()
 
     device = args.device
+    
+    # CUDA 사용 가능한지 확인
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA를 사용할 수 없습니다. CPU로 전환합니다.")
+        device = 'cpu'
+    else:
+        if device == 'cuda':
+            print(f"CUDA 사용 가능: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024 / 1024:.2f} MB")
 
     # DETECTION MODEL.
     inp_dets = args.detection_input_size
@@ -146,10 +140,7 @@ if __name__ == '__main__':
 
     fps_time = 0
     f = 0
-    paused = 0
     while cam.grabbed():
-        if paused > 0:
-            paused -= 1
         f += 1
         frame = cam.getitem()
         image = frame.copy()
@@ -232,15 +223,7 @@ if __name__ == '__main__':
             writer.write(frame)
         imS = image_resize(frame, height=2200)
         cv2.imshow('frame', imS)
-        if event:
-            if paused <= 0:
-                paused = 120
-                image_name = "frame%d.jpg" % f
-                cv2.imwrite(image_name, frame)
-                send_whatsapp(image_name, event, "972543933773")
-            else:
-                print(paused)
-        event = ""
+        
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -248,4 +231,3 @@ if __name__ == '__main__':
     cam.stop()
     if outvid:
         writer.release()
-    cv2.destroyAllWindows()
