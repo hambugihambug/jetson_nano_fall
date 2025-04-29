@@ -23,19 +23,22 @@ class TSSTG(object):
 
         self.model = TwoStreamSpatialTemporalGraph(self.graph_args, self.num_class).to(self.device)
         
+        # 변환된 모델 파일 확인
+        converted_weight_file = weight_file.replace('.pth', '-converted.pth')
+        if os.path.exists(converted_weight_file):
+            print(f"변환된 액션 인식 모델 사용: {converted_weight_file}")
+            model_path = converted_weight_file
+        else:
+            print(f"경고: 변환된 모델 파일({converted_weight_file})이 없습니다.")
+            print("python3 convert_model.py --action 명령어로 모델을 변환해주세요.")
+            model_path = weight_file
+            
         try:
-            self.model.load_state_dict(torch.load(weight_file, map_location='cpu'))
+            self.model.load_state_dict(torch.load(model_path, map_location='cpu'))
+            print("액션 인식 모델을 성공적으로 로드했습니다.")
         except Exception as e:
             print(f"액션 인식 모델 로딩 실패: {e}")
-            try:
-                print("다른 방법으로 액션 인식 모델 로딩 시도...")
-                with open(weight_file, 'rb') as f:
-                    state_dict = torch.load(f, map_location='cpu')
-                    self.model.load_state_dict(state_dict)
-                print("성공적으로 모델을 로드했습니다.")
-            except Exception as e2:
-                print(f"액션 인식 모델 로딩 재시도 실패: {e2}")
-                raise RuntimeError("액션 인식 모델 로딩 실패")
+            raise RuntimeError("액션 인식 모델 로딩 실패")
                 
         self.model.eval()
 

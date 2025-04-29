@@ -21,38 +21,48 @@ class SPPE_FastPose(object):
         self.device = device
 
         if backbone == 'resnet101':
-            weights_file = 'Models/sppe/fast_res101_320x256.pth'
+            original_weights_file = 'Models/sppe/fast_res101_320x256.pth'
+            converted_weights_file = 'Models/sppe/fast_res101_320x256-converted.pth'
+            
+            # 변환된 모델 파일 확인
+            if os.path.exists(converted_weights_file):
+                print(f"변환된 ResNet101 포즈 모델 사용: {converted_weights_file}")
+                weights_file = converted_weights_file
+            else:
+                print(f"경고: 변환된 모델 파일({converted_weights_file})이 없습니다.")
+                print("python3 convert_model.py --sppe 명령어로 모델을 변환해주세요.")
+                weights_file = original_weights_file
+                
             try:
-                self.model = InferenNet_fast(weights_file, device).to(device)
+                # 포즈 모델 생성 후 가중치 로딩
+                self.model = InferenNet_fast().to(device)
+                self.model.load_state_dict(torch.load(weights_file, map_location=device))
+                print("포즈 모델(ResNet101)을 성공적으로 로드했습니다.")
             except Exception as e:
                 print(f"포즈 모델(ResNet101) 로딩 실패: {e}")
-                try:
-                    print("다른 방법으로 포즈 모델 로딩 시도...")
-                    self.model = InferenNet_fast().to(device)
-                    with open(weights_file, 'rb') as f:
-                        state_dict = torch.load(f, map_location=device)
-                        self.model.load_state_dict(state_dict)
-                    print("성공적으로 모델을 로드했습니다.")
-                except Exception as e2:
-                    print(f"포즈 모델 로딩 재시도 실패: {e2}")
-                    raise RuntimeError("포즈 모델 로딩 실패")
-        else:
-            weights_file = 'Models/sppe/fast_res50_256x192.pth'
+                raise RuntimeError("포즈 모델 로딩 실패")
+                
+        else:  # resnet50
+            original_weights_file = 'Models/sppe/fast_res50_256x192.pth'
+            converted_weights_file = 'Models/sppe/fast_res50_256x192-converted.pth'
+            
+            # 변환된 모델 파일 확인
+            if os.path.exists(converted_weights_file):
+                print(f"변환된 ResNet50 포즈 모델 사용: {converted_weights_file}")
+                weights_file = converted_weights_file
+            else:
+                print(f"경고: 변환된 모델 파일({converted_weights_file})이 없습니다.")
+                print("python3 convert_model.py --sppe 명령어로 모델을 변환해주세요.")
+                weights_file = original_weights_file
+                
             try:
-                self.model = InferenNet_fastRes50(weights_file, device).to(device)
+                # 포즈 모델 생성 후 가중치 로딩
+                self.model = InferenNet_fastRes50().to(device)
+                self.model.load_state_dict(torch.load(weights_file, map_location=device))
+                print("포즈 모델(ResNet50)을 성공적으로 로드했습니다.")
             except Exception as e:
                 print(f"포즈 모델(ResNet50) 로딩 실패: {e}")
-                try:
-                    print("다른 방법으로 포즈 모델 로딩 시도...")
-                    # 모델 구조 생성 후 가중치 로딩 시도
-                    self.model = InferenNet_fastRes50().to(device)
-                    with open(weights_file, 'rb') as f:
-                        state_dict = torch.load(f, map_location=device)
-                        self.model.load_state_dict(state_dict)
-                    print("성공적으로 모델을 로드했습니다.")
-                except Exception as e2:
-                    print(f"포즈 모델 로딩 재시도 실패: {e2}")
-                    raise RuntimeError("포즈 모델 로딩 실패")
+                raise RuntimeError("포즈 모델 로딩 실패")
         
         self.model.eval()
 
