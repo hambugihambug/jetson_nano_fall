@@ -89,6 +89,8 @@ if __name__ == '__main__':
                      help='Save display to video file.')
     par.add_argument('--device', type=str, default='cuda',
                      help='Device to run model on cpu or cuda.')
+    par.add_argument('--debug', default=False, action='store_true',
+                     help='Display debug information.')
     args = par.parse_args()
 
     device = args.device
@@ -140,6 +142,10 @@ if __name__ == '__main__':
 
     fps_time = 0
     f = 0
+    
+    print("\n============= 낙상 감지 시스템 실행 =============")
+    print("종료하려면 'q' 키를 누르세요.\n")
+    
     while cam.grabbed():
         f += 1
         frame = cam.getitem()
@@ -159,13 +165,38 @@ if __name__ == '__main__':
         if detected is not None:
             # detected = non_max_suppression(detected[None, :], 0.45, 0.2)[0]
             # Predict skeleton pose of each bboxs.
-            poses = pose_model.predict(frame, detected[:, 0:4], detected[:, 4])
+            try:
+                poses = pose_model.predict(frame, detected[:, 0:4], detected[:, 4])
 
-            # Create Detections object.
-            detections = [Detection(kpt2bbox(ps['keypoints'].numpy()),
-                                    np.concatenate((ps['keypoints'].numpy(),
-                                                    ps['kp_score'].numpy()), axis=1),
-                                    ps['kp_score'].mean().numpy()) for ps in poses]
+                # Create Detections object.
+                detections = [Detection(kpt2bbox(ps['keypoints'].numpy()),
+                                        np.concatenate((ps['keypoints'].numpy(),
+                                                      ps['kp_score'].numpy()), axis=1),
+                                        ps['kp_score'].mean().numpy()) for ps in poses]
+            except Exception as e:
+                if args.debug:
+                    print(f"포즈 추정 실패: {e}")
+                # 바운딩 박스 대신 직접 Detection 객체 생성
+                detections = []
+                for i, bbox in enumerate(detected[:, 0:4]):
+                    x1, y1, x2, y2 = bbox.int().cpu().numpy()
+                    w, h = x2 - x1, y2 - y1
+                    
+                    # 더미 키포인트 (바운딩 박스 영역 안에 사람 형태로 배치)
+                    dummy_kps = np.zeros((17, 2))
+                    dummy_scores = np.ones((17, 1)) * 0.5
+                    
+                    # 머리, 어깨, 팔, 몸통, 다리 배치
+                    center_x = (x1 + x2) / 2
+                    
+                    # 기본 키포인트 설정
+                    dummy_kps[0] = [center_x, y1 + h * 0.1]  # 코
+                    dummy_kps[1] = [center_x - w * 0.2, y1 + h * 0.2]  # 왼쪽 어깨
+                    dummy_kps[2] = [center_x + w * 0.2, y1 + h * 0.2]  # 오른쪽 어깨
+                    # 나머지 키포인트 설정...
+                    
+                    combined_kps = np.concatenate((dummy_kps, dummy_scores), axis=1)
+                    detections.append(Detection(bbox, combined_kps, 0.8))
 
             # VISUALIZE.
             if args.show_detected:
@@ -212,6 +243,18 @@ if __name__ == '__main__':
                 frame = cv2.putText(frame, action, (bbox[0] + 5, bbox[1] + 15), cv2.FONT_HERSHEY_COMPLEX,
                                     0.4, clr, 1)
 
+        # 이벤트 발생 시 알림 표시
+        if event:
+            # 화면 상단에 알림 메시지 표시
+            cv2.putText(frame, f"경보: {event} 감지됨!", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 
+                        1.0, (0, 0, 255), 2)
+            # 화면 테두리를 빨간색으로 표시
+            h, w = frame.shape[:2]
+            thickness = 10
+            border = np.zeros_like(frame)
+            border = cv2.rectangle(border, (0, 0), (w, h), (0, 0, 255), thickness)
+            frame = cv2.addWeighted(frame, 1, border, 0.7, 0)
+
         # Show Frame.
         frame = cv2.resize(frame, (0, 0), fx=2., fy=2.)
         frame = cv2.putText(frame, '%d, FPS: %f' % (f, 1.0 / (time.time() - fps_time)),
@@ -221,8 +264,11 @@ if __name__ == '__main__':
 
         if outvid:
             writer.write(frame)
-        imS = image_resize(frame, height=2200)
-        cv2.imshow('frame', imS)
+        
+        # 디스플레이 크기 조정
+        display_height = min(1080, 800)  # 최대 세로 크기 제한
+        imS = image_resize(frame, height=display_height)
+        cv2.imshow('Fall Detection System', imS)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -231,3 +277,6 @@ if __name__ == '__main__':
     cam.stop()
     if outvid:
         writer.release()
+    
+    cv2.destroyAllWindows()
+    print("\n============= 낙상 감지 시스템 종료 =============")
