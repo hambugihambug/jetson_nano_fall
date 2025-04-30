@@ -29,11 +29,58 @@ class TinyYOLOv3_onecls(object):
                  conf_thres=0.45,
                  device='cpu'):
         self.input_size = input_size
+        self.device = device
+        
+        # Jetson Nano 최적화 설정
+        self.optimize_memory = "Tegra" in torch.cuda.get_device_name(0) if device == 'cuda' and torch.cuda.is_available() else False
+        if self.optimize_memory and device == 'cuda':
+            print("YOLO: Jetson Nano 메모리 최적화 활성화")
+            torch.backends.cudnn.benchmark = True
+        
         self.model = Darknet(config_file).to(device)
         
-        self.model.load_state_dict(torch.load(weight_file, map_location=device))
+        # 변환된 모델 파일 확인
+        converted_weight_file = weight_file.replace('.pth', '-converted.pth')
+        if os.path.exists(converted_weight_file):
+            print(f"변환된 객체 감지 모델 사용: {converted_weight_file}")
+            weights_file = converted_weight_file
+        else:
+            print(f"경고: 변환된 모델 파일({converted_weight_file})이 없습니다.")
+            print("python3 convert_model.py --detect 명령어로 모델을 변환해주세요.")
+            weights_file = weight_file
+            
+        try:
+            self.model.load_state_dict(torch.load(weights_file, map_location=device))
+            print("객체 감지 모델을 성공적으로 로드했습니다.")
+        except Exception as e:
+            print(f"객체 감지 모델 로딩 실패: {e}")
+            raise RuntimeError("객체 감지 모델을 로드할 수 없습니다. 모델을 변환해주세요.")
+            
+        # Jetson Nano 최적화: 모델을 FP16으로 변환하여 속도 향상
+        if self.optimize_memory and device == 'cuda':
+            try:
+                self.model = self.model.half()  # FP16으로 변환
+                print("YOLO: 모델을 FP16으로 변환하여 속도 최적화")
+            except Exception as e:
+                print(f"FP16 변환 실패: {e}")
+            
         self.model.eval()
-        self.device = device
+        
+        # GPU 메모리 최적화
+        if self.optimize_memory and device == 'cuda':
+            torch.cuda.empty_cache()
+            # 모델 트레이싱으로 최적화
+            try:
+                self.use_traced_model = False
+                dummy_input = torch.zeros((1, 3, input_size, input_size)).to(device)
+                if self.optimize_memory:
+                    dummy_input = dummy_input.half()
+                self.traced_model = torch.jit.trace(self.model, dummy_input)
+                self.use_traced_model = True
+                print("YOLO: 모델 트레이싱으로 추론 속도 최적화")
+            except Exception as e:
+                print(f"모델 트레이싱 실패: {e}")
+                self.use_traced_model = False
 
         self.nms = nms
         self.conf_thres = conf_thres
@@ -58,11 +105,28 @@ class TinyYOLOv3_onecls(object):
             image_size = image.shape[:2]
             image = self.resize_fn(image)
 
-        image = self.transf_fn(image)[None, ...]
+        image_tensor = self.transf_fn(image)[None, ...]
+        
+        # Jetson Nano 최적화 적용
+        if self.optimize_memory and self.device == 'cuda':
+            image_tensor = image_tensor.half()  # FP16으로 변환
+        
+        # 배치 처리
         scf = torch.min(self.input_size / torch.FloatTensor([image_size]), 1)[0]
-
-        detected = self.model(image.to(self.device))
+        
+        with torch.no_grad():  # 추론 시 그래디언트 계산 비활성화로 메모리 사용량 감소
+            # 비동기 데이터 전송으로 속도 향상
+            if self.optimize_memory:
+                image_tensor = image_tensor.to(self.device, non_blocking=True)
+                if self.use_traced_model:
+                    detected = self.traced_model(image_tensor)
+                else:
+                    detected = self.model(image_tensor)
+            else:
+                detected = self.model(image_tensor.to(self.device))
+                
         detected = non_max_suppression(detected, self.conf_thres, self.nms)[0]
+        
         if detected is not None:
             detected[:, [0, 2]] -= (self.input_size - scf * image_size[1]) / 2
             detected[:, [1, 3]] -= (self.input_size - scf * image_size[0]) / 2
@@ -70,6 +134,13 @@ class TinyYOLOv3_onecls(object):
 
             detected[:, 0:2] = np.maximum(0, detected[:, 0:2] - expand_bb)
             detected[:, 2:4] = np.minimum(image_size[::-1], detected[:, 2:4] + expand_bb)
+            
+        # 메모리 최적화
+        if self.optimize_memory and self.device == 'cuda':
+            if hasattr(torch.cuda, 'empty_cache'):
+                # 30% 확률로 캐시 비우기 (매번 비우면 성능 저하)
+                if np.random.random() < 0.3:
+                    torch.cuda.empty_cache()
 
         return detected
 

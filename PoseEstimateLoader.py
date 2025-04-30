@@ -20,6 +20,12 @@ class SPPE_FastPose(object):
         self.inp_h = input_height
         self.inp_w = input_width
         self.device = device
+        
+        # Jetson Nano 최적화 설정
+        self.optimize_memory = "Tegra" in torch.cuda.get_device_name(0) if device == 'cuda' and torch.cuda.is_available() else False
+        if self.optimize_memory and device == 'cuda':
+            print("SPPE: Jetson Nano 메모리 최적화 활성화")
+            torch.backends.cudnn.benchmark = True
 
         if backbone == 'resnet101':
             original_weights_file = 'Models/sppe/fast_res101_320x256.pth'
@@ -57,11 +63,73 @@ class SPPE_FastPose(object):
             self.model.load_state_dict(torch.load(weights_file, map_location=device))
             print("포즈 모델(ResNet50)을 성공적으로 로드했습니다.")
         
+        # Jetson Nano 최적화: 모델을 FP16으로 변환하여 속도 향상
+        if self.optimize_memory and device == 'cuda':
+            try:
+                self.model = self.model.half()  # FP16으로 변환
+                print("SPPE: 모델을 FP16으로 변환하여 속도 최적화")
+            except Exception as e:
+                print(f"FP16 변환 실패: {e}")
+                
         self.model.eval()
+        
+        # GPU 메모리 최적화
+        if self.optimize_memory and device == 'cuda':
+            torch.cuda.empty_cache()
+            # 모델 트레이싱으로 최적화
+            try:
+                self.use_traced_model = False
+                dummy_input = torch.zeros((1, 3, input_height, input_width)).to(device)
+                if self.optimize_memory:
+                    dummy_input = dummy_input.half()
+                self.traced_model = torch.jit.trace(self.model, dummy_input)
+                self.use_traced_model = True
+                print("SPPE: 모델 트레이싱으로 추론 속도 최적화")
+            except Exception as e:
+                print(f"모델 트레이싱 실패: {e}")
+                self.use_traced_model = False
 
     def predict(self, image, bboxs, bboxs_scores):
+        # 메모리 최적화
+        batch_size = min(len(bboxs), 4) if self.optimize_memory else len(bboxs)  # Jetson Nano에서는 배치 크기 제한
+        
+        # 입력 준비
         inps, pt1, pt2 = crop_dets(image, bboxs, self.inp_h, self.inp_w)
-        pose_hm = self.model(inps.to(self.device)).cpu().data
+        
+        # GPU 메모리 최적화를 위한 배치 처리
+        if self.optimize_memory and len(bboxs) > batch_size and self.device == 'cuda':
+            # 배치 단위로 처리
+            pose_hms = []
+            for i in range(0, len(inps), batch_size):
+                batch_inps = inps[i:i+batch_size]
+                if self.optimize_memory:
+                    batch_inps = batch_inps.half()  # FP16으로 변환
+                    
+                # 비동기 데이터 전송으로 속도 향상
+                batch_inps = batch_inps.to(self.device, non_blocking=True)
+                
+                with torch.no_grad():  # 추론 시 그래디언트 계산 비활성화로 메모리 사용량 감소
+                    if self.use_traced_model:
+                        batch_pose_hm = self.traced_model(batch_inps)
+                    else:
+                        batch_pose_hm = self.model(batch_inps)
+                pose_hms.append(batch_pose_hm.cpu())
+                
+                # 일정 주기로 캐시 비우기
+                if i % (batch_size * 2) == 0 and self.device == 'cuda':
+                    torch.cuda.empty_cache()
+                    
+            pose_hm = torch.cat(pose_hms, dim=0).data
+        else:
+            # 전체 배치 처리 (작은 배치 크기)
+            if self.optimize_memory and self.device == 'cuda':
+                inps = inps.half()  # FP16으로 변환
+                
+            with torch.no_grad():  # 추론 시 그래디언트 계산 비활성화로 메모리 사용량 감소
+                if self.use_traced_model and self.device == 'cuda':
+                    pose_hm = self.traced_model(inps.to(self.device, non_blocking=True)).cpu().data
+                else:
+                    pose_hm = self.model(inps.to(self.device)).cpu().data
 
         # Cut eyes and ears.
         pose_hm = torch.cat([pose_hm[:, :1, ...], pose_hm[:, 5:, ...]], dim=1)
@@ -69,4 +137,12 @@ class SPPE_FastPose(object):
         xy_hm, xy_img, scores = getPrediction(pose_hm, pt1, pt2, self.inp_h, self.inp_w,
                                           pose_hm.shape[-2], pose_hm.shape[-1])
         result = pose_nms(bboxs, bboxs_scores, xy_img, scores)
+        
+        # 메모리 최적화
+        if self.optimize_memory and self.device == 'cuda':
+            if hasattr(torch.cuda, 'empty_cache'):
+                # 30% 확률로 캐시 비우기 (매번 비우면 성능 저하)
+                if np.random.random() < 0.3:
+                    torch.cuda.empty_cache()
+        
         return result

@@ -4,6 +4,7 @@ import time
 import torch
 import argparse
 import numpy as np
+import gc
 
 from Detection.Utils import ResizePadding
 from CameraLoader import CamLoader, CamLoader_Q
@@ -71,6 +72,41 @@ def kpt2bbox(kpt, ex=20):
                      kpt[:, 0].max() + ex, kpt[:, 1].max() + ex))
 
 
+# Jetson Nano GPU 최적화 설정
+def optimize_cuda_for_jetson():
+    """Jetson Nano GPU 최적화 함수"""
+    # CUDA 설정 초기화
+    torch.backends.cudnn.enabled = True
+    
+    # 메모리 사용 최적화
+    torch.backends.cudnn.benchmark = True  # 반복적인 크기의 입력에 대해 성능 향상
+    
+    # 결정적 알고리즘 비활성화 (속도 향상)
+    torch.backends.cudnn.deterministic = False
+    
+    # 메모리 할당 전략 설정
+    if hasattr(torch.cuda, 'empty_cache'):
+        torch.cuda.empty_cache()
+    
+    # TensorRT 최적화 활성화 (가능한 경우)
+    try:
+        import torch2trt
+        print("TensorRT 최적화 사용 가능")
+    except ImportError:
+        print("TensorRT 최적화 사용 불가 (torch2trt 설치되지 않음)")
+    
+    # Jetson-specific 최적화
+    os.environ['CUDA_MODULE_LOADING'] = 'LAZY'  # 필요한 시점에 모듈 로딩
+    
+    # 메모리 사용 제한 설정 (MB 단위, Jetson Nano는 대략 4GB)
+    # total_memory = torch.cuda.get_device_properties(0).total_memory
+    # Jetson Nano를 위한 메모리 제한 (전체 메모리의 75%)
+    # max_memory = int(total_memory * 0.75)
+    # torch.cuda.set_per_process_memory_fraction(0.75)
+    
+    return True
+
+
 if __name__ == '__main__':
     par = argparse.ArgumentParser(description='Human Fall Detection Demo.')
     par.add_argument('-C', '--camera', default=source,  # required=True,  # default=2,
@@ -91,6 +127,10 @@ if __name__ == '__main__':
                      help='Device to run model on cpu or cuda.')
     par.add_argument('--debug', default=False, action='store_true',
                      help='Display debug information.')
+    par.add_argument('--optimize', default=True, action='store_true',
+                     help='Jetson Nano 최적화 활성화')
+    par.add_argument('--skip_frames', type=int, default=0,
+                     help='처리 속도 향상을 위해 건너뛸 프레임 수 (0: 건너뛰기 없음)')
     args = par.parse_args()
 
     device = args.device
@@ -102,7 +142,13 @@ if __name__ == '__main__':
     else:
         if device == 'cuda':
             print(f"CUDA 사용 가능: {torch.cuda.get_device_name(0)}")
-            print(f"CUDA 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024 / 1024:.2f} MB")
+            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024 / 1024
+            print(f"CUDA 메모리: {total_memory:.2f} MB")
+            
+            # Jetson Nano GPU 최적화
+            if args.optimize and "Tegra" in torch.cuda.get_device_name(0):
+                print("Jetson Nano GPU 최적화 적용 중...")
+                optimize_cuda_for_jetson()
 
     # DETECTION MODEL.
     inp_dets = args.detection_input_size
@@ -118,7 +164,7 @@ if __name__ == '__main__':
     tracker = Tracker(max_age=max_age, n_init=3)
 
     # Actions Estimate.
-    action_model = TSSTG()
+    action_model = TSSTG(device=device)  # device 파라미터 전달
 
     resize_fn = ResizePadding(inp_dets, inp_dets)
 
@@ -142,14 +188,35 @@ if __name__ == '__main__':
 
     fps_time = 0
     f = 0
+    fps_counter = 0
+    fps_avg = 0
+    processing_times = []
+    
+    # 메모리 사용량 모니터링 초기화
+    if device == 'cuda':
+        initial_memory = torch.cuda.memory_allocated() / 1024 / 1024
     
     print("\n============= 낙상 감지 시스템 실행 =============")
     print("종료하려면 'q' 키를 누르세요.\n")
     
     while cam.grabbed():
         f += 1
+        
+        # 프레임 건너뛰기 (성능 향상)
+        if args.skip_frames > 0 and f % (args.skip_frames + 1) != 0:
+            continue
+            
+        start_time = time.time()
+        
         frame = cam.getitem()
         image = frame.copy()
+
+        # 주기적으로 CUDA 캐시 비우기 (메모리 누수 방지)
+        if device == 'cuda' and f % 30 == 0:
+            torch.cuda.empty_cache()
+            if args.debug:
+                current_memory = torch.cuda.memory_allocated() / 1024 / 1024
+                print(f"CUDA 메모리 사용량: {current_memory:.2f} MB")
 
         # Detect humans bbox in the frame with detector model.
         detected = detect_model.detect(frame, need_resize=False, expand_bb=10)
@@ -236,9 +303,23 @@ if __name__ == '__main__':
             border = cv2.rectangle(border, (0, 0), (w, h), (0, 0, 255), thickness)
             frame = cv2.addWeighted(frame, 1, border, 0.7, 0)
 
+        # 프레임 처리 시간 및 FPS 계산
+        process_time = time.time() - start_time
+        processing_times.append(process_time)
+        
+        # 최근 30프레임의 평균 처리 시간으로 FPS 계산
+        if len(processing_times) > 30:
+            processing_times.pop(0)
+        avg_process_time = sum(processing_times) / len(processing_times)
+        current_fps = 1.0 / avg_process_time if avg_process_time > 0 else 0
+        
+        # FPS 이동 평균 계산
+        fps_counter += 1
+        fps_avg = fps_avg * 0.9 + current_fps * 0.1 if fps_counter > 1 else current_fps
+
         # Show Frame.
         frame = cv2.resize(frame, (0, 0), fx=2., fy=2.)
-        frame = cv2.putText(frame, '%d, FPS: %f' % (f, 1.0 / (time.time() - fps_time)),
+        frame = cv2.putText(frame, 'FPS: %.2f (Avg: %.2f)' % (current_fps, fps_avg),
                             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         frame = frame[:, :, ::-1]
         fps_time = time.time()
@@ -258,6 +339,16 @@ if __name__ == '__main__':
     cam.stop()
     if outvid:
         writer.release()
+        
+    # 최종 메모리 사용량 표시
+    if device == 'cuda':
+        final_memory = torch.cuda.memory_allocated() / 1024 / 1024
+        print(f"최종 CUDA 메모리 사용량: {final_memory:.2f} MB")
+        
+    # 리소스 해제    
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+        gc.collect()
     
     cv2.destroyAllWindows()
     print("\n============= 낙상 감지 시스템 종료 =============")
