@@ -3,6 +3,7 @@ import cv2
 import torch
 import numpy as np
 import warnings
+import gc
 
 from SPPE.src.main_fast_inference import InferenNet_fast, InferenNet_fastRes50
 from SPPE.src.utils.img import crop_dets
@@ -15,12 +16,14 @@ class SPPE_FastPose(object):
                  backbone,
                  input_height=320,
                  input_width=256,
-                 device='cpu'):
+                 device='cpu',
+                 low_memory=False):
         assert backbone in ['resnet50', 'resnet101'], '{} backbone is not support yet!'.format(backbone)
 
         self.inp_h = input_height
         self.inp_w = input_width
         self.device = device
+        self.low_memory = low_memory
         
         # 경고 메시지 필터링
         warnings.filterwarnings("ignore", message="Unexpected key")
@@ -31,6 +34,10 @@ class SPPE_FastPose(object):
         if self.optimize_memory and device == 'cuda':
             print("SPPE: Jetson Nano 메모리 최적화 활성화")
             torch.backends.cudnn.benchmark = True
+            
+            # 저메모리 모드일 경우 추가 최적화
+            if low_memory:
+                print("SPPE: 저메모리 모드 활성화 (작은 배치 크기 사용)")
 
         if backbone == 'resnet101':
             original_weights_file = 'Models/sppe/fast_res101_320x256.pth'
@@ -97,16 +104,25 @@ class SPPE_FastPose(object):
         # 트레이싱 비활성화
         self.use_traced_model = False
         print("SPPE: 트레이싱 비활성화 - 안정적인 실행 모드 사용")
+        
+        # 저메모리 모드일 경우 메모리 적극 정리
+        if self.low_memory and device == 'cuda':
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def predict(self, image, bboxs, bboxs_scores):
-        # 메모리 최적화
-        batch_size = min(len(bboxs), 4) if self.optimize_memory else len(bboxs)  # Jetson Nano에서는 배치 크기 제한
+        # 메모리 최적화 - 배치 사이즈 조정
+        batch_size = 1 if self.low_memory else min(len(bboxs), 4) if self.optimize_memory else len(bboxs)
         
         # 입력 준비
         inps, pt1, pt2 = crop_dets(image, bboxs, self.inp_h, self.inp_w)
         
+        # 저메모리 모드일 경우 메모리 정리
+        if self.low_memory and self.device == 'cuda':
+            torch.cuda.empty_cache()
+        
         # GPU 메모리 최적화를 위한 배치 처리
-        if self.optimize_memory and len(bboxs) > batch_size and self.device == 'cuda':
+        if len(bboxs) > batch_size and self.device == 'cuda':
             # 배치 단위로 처리
             pose_hms = []
             for i in range(0, len(inps), batch_size):
@@ -121,8 +137,11 @@ class SPPE_FastPose(object):
                     batch_pose_hm = self.model(batch_inps)
                 pose_hms.append(batch_pose_hm.cpu())
                 
-                # 일정 주기로 캐시 비우기
-                if i % (batch_size * 2) == 0 and self.device == 'cuda':
+                # 저메모리 모드일 경우 매 배치마다 캐시 비우기
+                if self.low_memory and self.device == 'cuda':
+                    torch.cuda.empty_cache()
+                # 일반 모드에서는 덜 자주 캐시 비우기
+                elif i % (batch_size * 2) == 0 and self.device == 'cuda':
                     torch.cuda.empty_cache()
                     
             pose_hm = torch.cat(pose_hms, dim=0).data
@@ -134,6 +153,10 @@ class SPPE_FastPose(object):
             with torch.no_grad():  # 추론 시 그래디언트 계산 비활성화로 메모리 사용량 감소
                 pose_hm = self.model(inps.to(self.device)).cpu().data
 
+        # 저메모리 모드에서 바로 메모리 정리
+        if self.low_memory and self.device == 'cuda':
+            torch.cuda.empty_cache()
+            
         # Cut eyes and ears.
         pose_hm = torch.cat([pose_hm[:, :1, ...], pose_hm[:, 5:, ...]], dim=1)
 
@@ -141,11 +164,16 @@ class SPPE_FastPose(object):
                                           pose_hm.shape[-2], pose_hm.shape[-1])
         result = pose_nms(bboxs, bboxs_scores, xy_img, scores)
         
+        # 메모리 최적화 - 필요 없는 변수 명시적 삭제
+        del pose_hm, xy_hm, xy_img, scores
+        
         # 메모리 최적화
-        if self.optimize_memory and self.device == 'cuda':
-            if hasattr(torch.cuda, 'empty_cache'):
+        if self.device == 'cuda':
+            if self.low_memory:
+                # 저메모리 모드에서는 항상 캐시 비우기
+                torch.cuda.empty_cache()
+            elif hasattr(torch.cuda, 'empty_cache') and np.random.random() < 0.3:
                 # 30% 확률로 캐시 비우기 (매번 비우면 성능 저하)
-                if np.random.random() < 0.3:
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
         
         return result

@@ -103,7 +103,31 @@ def optimize_cuda_for_jetson():
     # Jetson-specific 최적화
     os.environ['CUDA_MODULE_LOADING'] = 'LAZY'  # 필요한 시점에 모듈 로딩
     
+    # CUDA 메모리 사용량 제한 설정 (Jetson Nano 최적화)
+    try:
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        # 메모리의 70%만 사용하도록 제한
+        torch.cuda.set_per_process_memory_fraction(0.7)
+        print(f"CUDA 메모리 사용량을 70%로 제한 (최대 {total_memory/(1024*1024*1024):.2f} GB)")
+    except Exception as e:
+        print(f"메모리 제한 설정 실패: {e}")
+    
     return True
+
+
+# 시스템 메모리 정리 함수
+def clear_memory():
+    """시스템 메모리를 정리합니다."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # 리눅스 시스템에서 메모리 캐시 정리 (root 권한 필요)
+    try:
+        if os.path.exists('/proc/sys/vm/drop_caches'):
+            os.system('sync')
+            # 실제 환경에서는 sudo가 필요할 수 있음: sudo sh -c "echo 1 > /proc/sys/vm/drop_caches"
+    except:
+        pass
 
 
 if __name__ == '__main__':
@@ -134,6 +158,8 @@ if __name__ == '__main__':
                      help='불필요한 출력 메시지를 표시하지 않습니다.')
     par.add_argument('--skip_frames', type=int, default=0,
                      help='처리 속도 향상을 위해 건너뛸 프레임 수 (0: 건너뛰기 없음)')
+    par.add_argument('--low_memory', default=False, action='store_true',
+                     help='극도의 메모리 제한 모드 (더 많은 프레임 건너뛰기, 작은 배치 크기)')
     args = par.parse_args()
 
     # 불필요한 출력 메시지 억제
@@ -153,6 +179,14 @@ if __name__ == '__main__':
             total_memory = torch.cuda.get_device_properties(0).total_memory / 1024 / 1024
             print(f"CUDA 메모리: {total_memory:.2f} MB")
             
+            # 시스템 메모리 정리
+            clear_memory()
+            
+            # 저메모리 모드일 경우 자동으로 프레임 건너뛰기 활성화
+            if args.low_memory and args.skip_frames == 0:
+                args.skip_frames = 2  # 매 3번째 프레임만 처리
+                print(f"저메모리 모드: 프레임 건너뛰기 {args.skip_frames}로 설정")
+            
             # Jetson Nano GPU 최적화
             if args.optimize and "Tegra" in torch.cuda.get_device_name(0):
                 print("Jetson Nano GPU 최적화 적용 중...")
@@ -165,14 +199,15 @@ if __name__ == '__main__':
     # POSE MODEL.
     inp_pose = args.pose_input_size.split('x')
     inp_pose = (int(inp_pose[0]), int(inp_pose[1]))
-    pose_model = SPPE_FastPose(args.pose_backbone, inp_pose[0], inp_pose[1], device=device)
+    pose_model = SPPE_FastPose(args.pose_backbone, inp_pose[0], inp_pose[1], 
+                              device=device, low_memory=args.low_memory)
 
     # Tracker.
     max_age = 30
     tracker = Tracker(max_age=max_age, n_init=3)
 
     # Actions Estimate.
-    action_model = TSSTG(device=device)  # device 파라미터 전달
+    action_model = TSSTG(device=device, low_memory=args.low_memory)  # device 및 low_memory 전달
 
     resize_fn = ResizePadding(inp_dets, inp_dets)
 
@@ -203,6 +238,11 @@ if __name__ == '__main__':
     # 메모리 사용량 모니터링 초기화
     if device == 'cuda':
         initial_memory = torch.cuda.memory_allocated() / 1024 / 1024
+        print(f"초기 CUDA 메모리 사용량: {initial_memory:.2f} MB")
+        
+        # 메모리 부족 방지를 위한 초기화
+        torch.cuda.empty_cache()
+        gc.collect()
     
     print("\n============= 낙상 감지 시스템 실행 =============")
     print("종료하려면 'q' 키를 누르세요.\n")
@@ -220,9 +260,17 @@ if __name__ == '__main__':
         image = frame.copy()
 
         # 주기적으로 CUDA 캐시 비우기 (메모리 누수 방지)
-        if device == 'cuda' and f % 30 == 0:
-            torch.cuda.empty_cache()
-            if args.debug:
+        if device == 'cuda':
+            # 더 자주 메모리 정리 (저메모리 모드일 경우)
+            if args.low_memory and f % 10 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+            # 일반 모드에서는 덜 자주 정리
+            elif f % 30 == 0:
+                torch.cuda.empty_cache()
+                
+            # 디버그 모드에서 메모리 사용량 출력
+            if args.debug and f % 30 == 0:
                 current_memory = torch.cuda.memory_allocated() / 1024 / 1024
                 print(f"CUDA 메모리 사용량: {current_memory:.2f} MB")
 
@@ -355,8 +403,9 @@ if __name__ == '__main__':
         
     # 리소스 해제    
     if device == 'cuda':
-        torch.cuda.empty_cache()
-        gc.collect()
+        for _ in range(3):  # 여러 번 캐시 비우기 시도
+            torch.cuda.empty_cache()
+            gc.collect()
     
     cv2.destroyAllWindows()
     print("\n============= 낙상 감지 시스템 종료 =============")

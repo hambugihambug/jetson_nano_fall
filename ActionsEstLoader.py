@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 import warnings
+import gc
 
 from Actionsrecognition.Models import TwoStreamSpatialTemporalGraph
 from pose_utils import normalize_points_with_size, scale_pose
@@ -15,7 +16,8 @@ class TSSTG(object):
     """
     def __init__(self,
                  weight_file='./Models/TSSTG/tsstg-model.pth',
-                 device='cpu'):
+                 device='cpu',
+                 low_memory=False):
         # 경고 메시지 필터링
         warnings.filterwarnings("ignore", message="Unexpected key")
         warnings.filterwarnings("ignore", message="Missing key")
@@ -25,6 +27,7 @@ class TSSTG(object):
                             'Stand up', 'Sit down', 'Fall Down']
         self.num_class = len(self.class_names)
         self.device = device
+        self.low_memory = low_memory
 
         # 메모리 최적화 설정
         self.optimize_memory = "Tegra" in torch.cuda.get_device_name(0) if device == 'cuda' and torch.cuda.is_available() else False
@@ -32,6 +35,10 @@ class TSSTG(object):
         if self.optimize_memory and device == 'cuda':
             print("TSSTG: Jetson Nano 메모리 최적화 활성화")
             torch.backends.cudnn.benchmark = True
+            
+            # 저메모리 모드 설정
+            if low_memory:
+                print("TSSTG: 저메모리 모드 활성화")
         
         self.model = TwoStreamSpatialTemporalGraph(self.graph_args, self.num_class).to(self.device)
         
@@ -63,7 +70,7 @@ class TSSTG(object):
         
         # Jetson Nano 최적화: FP16 변환은 모델 종류에 따라 오류가 발생할 수 있으므로 선택적 사용
         self.use_fp16 = False
-        if self.optimize_memory and device == 'cuda':
+        if self.optimize_memory and device == 'cuda' and not self.low_memory:
             try:
                 # 간단한 입력으로 테스트
                 dummy_input = torch.zeros((1, 3, 30, 17), dtype=torch.float32).to(device)
@@ -80,6 +87,20 @@ class TSSTG(object):
             except Exception as e:
                 print(f"TSSTG: FP16 변환 테스트 실패, FP32 모드로 계속 진행: {e}")
                 self.use_fp16 = False
+                
+        # 저메모리 모드일 경우 FP16 비활성화
+        if self.low_memory and self.use_fp16:
+            print("TSSTG: 저메모리 모드에서는 FP16 비활성화됨")
+            self.use_fp16 = False
+            try:
+                self.model = self.model.float()  # FP32로 다시 변환
+            except:
+                pass
+                
+        # 저메모리 모드일 경우 메모리 적극 정리
+        if self.low_memory and device == 'cuda':
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def predict(self, pts, image_size):
         """Predict actions from single person skeleton points and score in time sequence.
@@ -92,6 +113,10 @@ class TSSTG(object):
         Returns:
             (numpy array) Probability of each class actions.
         """
+        # 저메모리 모드일 경우 미리 메모리 정리
+        if self.low_memory and self.device == 'cuda':
+            torch.cuda.empty_cache()
+            
         pts[:, :, :2] = normalize_points_with_size(pts[:, :, :2], image_size[0], image_size[1])
         pts[:, :, :2] = scale_pose(pts[:, :, :2])
         pts = np.concatenate((pts, np.expand_dims((pts[:, 1, :] + pts[:, 2, :]) / 2, 1)), axis=1)
@@ -118,12 +143,20 @@ class TSSTG(object):
 
         with torch.no_grad():  # 추론 시 그래디언트 계산 비활성화로 메모리 사용량 감소
             out = self.model((pts, mot))
+            
+        # 큰 텐서들 명시적으로 해제
+        del pts, mot
+        result = out.detach().cpu().numpy()
+        del out
 
         # 메모리 최적화
-        if self.optimize_memory and self.device == 'cuda':
-            if hasattr(torch.cuda, 'empty_cache'):
+        if self.device == 'cuda':
+            if self.low_memory:
+                # 저메모리 모드에서는 매번 메모리 정리
+                torch.cuda.empty_cache()
+                gc.collect()
+            elif hasattr(torch.cuda, 'empty_cache') and np.random.random() < 0.3:
                 # 30% 확률로 캐시 비우기 (매번 비우면 성능 저하)
-                if np.random.random() < 0.3:
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
-        return out.detach().cpu().numpy()
+        return result
