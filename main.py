@@ -176,27 +176,8 @@ if __name__ == '__main__':
             except Exception as e:
                 if args.debug:
                     print(f"포즈 추정 실패: {e}")
-                # 바운딩 박스 대신 직접 Detection 객체 생성
+                # 예외 발생 시 빈 detections 리스트 유지
                 detections = []
-                for i, bbox in enumerate(detected[:, 0:4]):
-                    x1, y1, x2, y2 = bbox.int().cpu().numpy()
-                    w, h = x2 - x1, y2 - y1
-                    
-                    # 더미 키포인트 (바운딩 박스 영역 안에 사람 형태로 배치)
-                    dummy_kps = np.zeros((17, 2))
-                    dummy_scores = np.ones((17, 1)) * 0.5
-                    
-                    # 머리, 어깨, 팔, 몸통, 다리 배치
-                    center_x = (x1 + x2) / 2
-                    
-                    # 기본 키포인트 설정
-                    dummy_kps[0] = [center_x, y1 + h * 0.1]  # 코
-                    dummy_kps[1] = [center_x - w * 0.2, y1 + h * 0.2]  # 왼쪽 어깨
-                    dummy_kps[2] = [center_x + w * 0.2, y1 + h * 0.2]  # 오른쪽 어깨
-                    # 나머지 키포인트 설정...
-                    
-                    combined_kps = np.concatenate((dummy_kps, dummy_scores), axis=1)
-                    detections.append(Detection(bbox, combined_kps, 0.8))
 
             # VISUALIZE.
             if args.show_detected:
