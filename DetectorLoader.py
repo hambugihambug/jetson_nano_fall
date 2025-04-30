@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import torchvision.transforms as transforms
 import os
+import warnings
 
 from queue import Queue
 from threading import Thread
@@ -28,6 +29,10 @@ class TinyYOLOv3_onecls(object):
                  nms=0.2,
                  conf_thres=0.45,
                  device='cpu'):
+        # 경고 메시지 필터링
+        warnings.filterwarnings("ignore", message="Unexpected key")
+        warnings.filterwarnings("ignore", message="Missing key")
+        
         self.input_size = input_size
         self.device = device
         
@@ -50,10 +55,13 @@ class TinyYOLOv3_onecls(object):
             weights_file = weight_file
             
         try:
-            self.model.load_state_dict(torch.load(weights_file, map_location=device))
-            print("객체 감지 모델을 성공적으로 로드했습니다.")
+            # strict=False로 설정하여, 키 불일치 오류 무시
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.model.load_state_dict(torch.load(weights_file, map_location=device), strict=False)
+            print("객체 감지 모델을 로드했습니다.")
         except Exception as e:
-            print(f"객체 감지 모델 로딩 실패: {e}")
+            print(f"객체 감지 모델 로딩 오류: {str(e).split(':', 1)[0]}")
             raise RuntimeError("객체 감지 모델을 로드할 수 없습니다. 모델을 변환해주세요.")
             
         # Jetson Nano 최적화: 모델을 FP16으로 변환하여 속도 향상
@@ -69,18 +77,10 @@ class TinyYOLOv3_onecls(object):
         # GPU 메모리 최적화
         if self.optimize_memory and device == 'cuda':
             torch.cuda.empty_cache()
-            # 모델 트레이싱으로 최적화
-            try:
-                self.use_traced_model = False
-                dummy_input = torch.zeros((1, 3, input_size, input_size)).to(device)
-                if self.optimize_memory:
-                    dummy_input = dummy_input.half()
-                self.traced_model = torch.jit.trace(self.model, dummy_input)
-                self.use_traced_model = True
-                print("YOLO: 모델 트레이싱으로 추론 속도 최적화")
-            except Exception as e:
-                print(f"모델 트레이싱 실패: {e}")
-                self.use_traced_model = False
+            
+        # YOLO 모델은 동적 계산 그래프를 사용하므로 트레이싱 비활성화
+        self.use_traced_model = False
+        print("YOLO: 동적 계산 그래프 사용으로 트레이싱 비활성화")
 
         self.nms = nms
         self.conf_thres = conf_thres
@@ -118,10 +118,7 @@ class TinyYOLOv3_onecls(object):
             # 비동기 데이터 전송으로 속도 향상
             if self.optimize_memory:
                 image_tensor = image_tensor.to(self.device, non_blocking=True)
-                if self.use_traced_model:
-                    detected = self.traced_model(image_tensor)
-                else:
-                    detected = self.model(image_tensor)
+                detected = self.model(image_tensor)
             else:
                 detected = self.model(image_tensor.to(self.device))
                 

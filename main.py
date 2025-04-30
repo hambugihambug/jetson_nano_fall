@@ -5,6 +5,7 @@ import torch
 import argparse
 import numpy as np
 import gc
+import warnings
 
 from Detection.Utils import ResizePadding
 from CameraLoader import CamLoader, CamLoader_Q
@@ -20,6 +21,10 @@ from ActionsEstLoader import TSSTG
 # source = '../Data/falldata/Home/Videos/video (2).avi'  # hard detect
 source = '../Data/falldata/Home/Videos/video (1).avi'
 
+# 경고 메시지 필터링
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 # source = 2
 
@@ -98,12 +103,6 @@ def optimize_cuda_for_jetson():
     # Jetson-specific 최적화
     os.environ['CUDA_MODULE_LOADING'] = 'LAZY'  # 필요한 시점에 모듈 로딩
     
-    # 메모리 사용 제한 설정 (MB 단위, Jetson Nano는 대략 4GB)
-    # total_memory = torch.cuda.get_device_properties(0).total_memory
-    # Jetson Nano를 위한 메모리 제한 (전체 메모리의 75%)
-    # max_memory = int(total_memory * 0.75)
-    # torch.cuda.set_per_process_memory_fraction(0.75)
-    
     return True
 
 
@@ -129,10 +128,19 @@ if __name__ == '__main__':
                      help='Display debug information.')
     par.add_argument('--optimize', default=True, action='store_true',
                      help='Jetson Nano 최적화 활성화')
+    par.add_argument('--no_fp16', default=False, action='store_true',
+                     help='FP16(반정밀도) 최적화를 비활성화합니다.')
+    par.add_argument('--quiet', default=False, action='store_true',
+                     help='불필요한 출력 메시지를 표시하지 않습니다.')
     par.add_argument('--skip_frames', type=int, default=0,
                      help='처리 속도 향상을 위해 건너뛸 프레임 수 (0: 건너뛰기 없음)')
     args = par.parse_args()
 
+    # 불필요한 출력 메시지 억제
+    if args.quiet:
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # TensorFlow 메시지 숨기기
+        warnings.filterwarnings('ignore')  # 경고 메시지 숨기기
+    
     device = args.device
     
     # CUDA 사용 가능한지 확인
@@ -341,7 +349,7 @@ if __name__ == '__main__':
         writer.release()
         
     # 최종 메모리 사용량 표시
-    if device == 'cuda':
+    if device == 'cuda' and args.debug:
         final_memory = torch.cuda.memory_allocated() / 1024 / 1024
         print(f"최종 CUDA 메모리 사용량: {final_memory:.2f} MB")
         
